@@ -1,0 +1,58 @@
+[project]
+name = "atracks"
+dynamic = ["version"]
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+]
+requires-python = ">=3.13"
+description = "Tool to track spindle pole movements in fluorescently labeled mitotic cells."
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+[project.optional-dependencies]
+napari = ["atracks-napari"]
+
+[project.scripts]
+atracks = "atracks.app:main"
+
+[project.gui-scripts]
+atracks = "atracks.app:main"
+
+[project.urls]
+Homepage = "https://github.com/ksiller/atracks"
+Issues = "https://github.com/ksiller/atracks/issues"
+
+[build-system]
+requires = [
+    "hatchling",
+    "versioningit",
+]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "versioningit"
+
+[tool.versioningit.vcs]
+match = ["[0-9]*.[0-9]*.[0-9]*", "[0-9]*.[0-9]*.[0-9]*.dev[0-9]*"]
+default-tag = "0.0.0"
+
+[tool.versioningit.next-version]
+method = "smallest-release"
+
+[tool.versioningit.write]
+method = { module = "write_version_info", value = "write_version_info"}
+path = "src/atracks/_version.py"
+
+[tool.versioningit.format]
+distance = "{base_version}.post{distance}+{vcs}{rev}"
+dirty = "{base_version}+d{build_date:%Y%m%d}"
+distance-dirty = "{base_version}.post{distance}+{vcs}{rev}.d{build_date:%Y%m%d}"
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/atracks", "/README.md", "/LICENSE", "/pyproject.toml"]
+
