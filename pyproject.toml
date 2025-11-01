@@ -4,13 +4,17 @@ dynamic = ["version"]
 dependencies = [
     "numpy",
     "opencv-python-headless",
+    "torch",
+    "torchvision",
+    "trackastra<0.4",
+    "tifffile",
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 description = "Tool to track spindle pole movements in fluorescently labeled mitotic cells."
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 

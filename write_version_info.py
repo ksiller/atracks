@@ -10,8 +10,19 @@ from typing import Any
 def write_version_info(
     project_dir: str | Path, template_fields: dict[str, Any], params: dict[str, Any]
 ) -> None:
-    """
-    Write the build info to the project directory.
+    """Write version/build info module used by the package at build time.
+
+    Args:
+        project_dir (str | Path): Root directory of the project where the
+            version module should be written.
+        template_fields (dict[str, Any]): Fields provided by versioningit
+            including version, build_date, etc.
+        params (dict[str, Any]): Parameters from pyproject configuration.
+            Expected key: "path" – relative path to the target module file,
+            defaulting to "src/atracks/_version.py".
+
+    Returns:
+        None
     """
     path = Path(project_dir) / params.get("path", "src/atracks/_version.py")
 
