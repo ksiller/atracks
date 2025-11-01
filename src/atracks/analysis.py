@@ -290,6 +290,7 @@ def iterative_threshold(
                 img_min = float(np.min(img))
                 img_max = float(np.max(img))
         else:
+            img_min = float(np.min(img))
             img_max = float(np.max(img))
     
     #img_min = 0.0

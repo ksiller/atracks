@@ -4,6 +4,8 @@ dynamic = ["version"]
 dependencies = [
     "numpy",
     "opencv-python-headless",
+    "scikit-image",
+    "scipy",
     "torch",
     "torchvision",
     "trackastra<0.4",
