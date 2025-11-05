@@ -1,4 +1,5 @@
 import logging
+from sys import thread_info
 
 import numpy as np
 
@@ -36,7 +37,6 @@ from joblib import Parallel, delayed
 
 from .utils import auto_value_range, check_device
 from .vis import spatial_probability_3d
-from .preprocess import noise2stack_denoise, dog_gpu
 
 
 logger = logging.getLogger(__name__)
@@ -99,8 +99,7 @@ def coords_from_stats(planes_dict: dict) -> np.ndarray:
 
 def analyze(
     input: str | np.ndarray,
-    sigma_low: float | tuple[float, ...] = 1.0,
-    sigma_high: float | tuple[float, ...] = 5.0,
+    workers: int = -1,
     verbose: int = 10,
 ) -> None:
     """Run analysis on the provided input and write results to output.
@@ -108,22 +107,16 @@ def analyze(
     Args:
         input (str | np.ndarray): Path to the input resource (e.g., MP4 file or directory)
             or numpy array (T, H, W, C).
-        output (str): Path to the output file or directory for results.
-        grayscale (bool): If True, convert loaded video frames to grayscale.
-        start_frame (int | None): Optional starting frame index (0-based). If None, starts at 0.
-        end_frame (int | None): Optional inclusive ending frame index. If None, reads until EOF.
-        sigma_low (float | tuple[float, ...]): Sigma for the first (lower) Gaussian blur.
-        sigma_high (float | tuple[float, ...]): Sigma for the second (higher) Gaussian blur.
+        workers (int): Number of workers for parallel processing. Defaults to -1 (all available cores).
+        verbose (int): Verbosity level for joblib.Parallel. Defaults to 10 (medium output).
 
     Returns:
-        None
+        tuple: (mask, f_mask, hole_mask, final_stats, probs_img, centroids)
     """
-    denoised = noise2stack_denoise(input)
-    dog = dog_gpu(input, sigma_low=sigma_low, sigma_high=sigma_high)
-
-    mask = segment_spots(dog, method="local", verbose=verbose)
-    stats = object_stats(mask, summary_only=True, verbose=verbose)
+    mask = segment_spots(input, method="local", workers=workers, verbose=verbose)
+    stats = object_stats(mask, summary_only=True, workers=workers, verbose=verbose)
     global_stats = stats["combined"]
+    print(global_stats)
 
     f_mask = filter_mask(
         mask,
@@ -131,21 +124,72 @@ def analyze(
         circularity=auto_value_range(
             global_stats["circularity_median"], tolerance=0.25
         ),
-        solidity=(0.8, 1.0),
+        solidity=auto_value_range(global_stats["solidity_median"], tolerance=0.25),
     )
     hole_mask = identify_lattice_holes(
         f_mask, radius=global_stats["nn_min_dist_mean"] // 2
     )
 
-    final_stats = object_stats(f_mask, summary_only=False, verbose=verbose)
+    final_stats = object_stats(
+        f_mask, summary_only=False, workers=workers, verbose=verbose
+    )
     centroids = coords_from_stats(final_stats["planes"])
     radius = final_stats["combined"]["nn_min_dist_median"]
     spread = final_stats["combined"]["nn_min_dist_std"]
     probs_img = spatial_probability_3d(
-        input.shape, centroids, radius=radius, sigma=spread, verbose=verbose
+        input.shape,
+        centroids,
+        radius=radius,
+        sigma=spread,
+        workers=workers,
+        verbose=verbose,
     )
+    """
+    min_val = np.min(input)
+    mean_val = np.mean(input)
+    max_val = np.max(input)
+    print(min_val, mean_val, max_val)
+    th1 = 0.5 * (max_val - mean_val) + mean_val
+    th2 = 0.25 * (max_val - mean_val) + mean_val
+    th3 = 0.125 * (max_val - mean_val) + mean_val
+    print(th1, th2, th3)
 
-    return denoised, dog, mask, f_mask, hole_mask, final_stats, probs_img, centroids
+    th_schedule = [(th1, None), (th2, th1), (th3, th2)]
+    it_schedule = [25, 25, 25]
+    area_schedule = [(15, 85), (10, 90), (10, 90)]
+    solidity_schedule = [(0.50, 1.0), (0.5, 1.0), (0.5, 1.0)]
+    aspect_ratio_schedule = [(0.2, 1.0), (0.3, 1.0), (0.3, 1.0)]
+    all_binaries = []
+    all_f_masks = [f_mask]
+    all_h_masks = [h_mask]
+    for th, it, area, solidity, aspect_ratio in zip(
+        th_schedule,
+        it_schedule,
+        area_schedule,
+        solidity_schedule,
+        aspect_ratio_schedule,
+    ):
+
+        binaries, f_regions = iterative_threshold(
+            input,
+            threshold=th,
+            mask=all_h_masks[-1],
+            iterations=it,
+            area=area,
+            solidity=solidity,
+            aspect_ratio=aspect_ratio,
+        )
+
+        f_mask = all_f_masks[-1] | (np.sum(binaries, axis=0) > 0)  # (f_regions >0)
+        h_mask = identify_lattice_holes(
+            f_mask, radius=final_stats["combined"]["nn_min_dist_mean"] // 2
+        )
+        all_binaries.append(binaries)
+        all_f_masks.append(f_mask)
+        all_h_masks.append(h_mask)
+
+    """
+    return mask, f_mask, hole_mask, final_stats, probs_img, centroids
 
 
 def segment_micro_sam(
@@ -428,16 +472,13 @@ def dilate_regions(
 
 def iterative_threshold(
     img: np.ndarray,
-    area: tuple[float, float],
     mask: np.ndarray | None = None,
     exclude_mask: np.ndarray | None = None,
-    circularity: tuple[float, float] | None = None,
-    solidity: tuple[float, float] | None = (0.95, 1.0),
-    aspect_ratio: tuple[float, float] | None = None,
     threshold: tuple[float, float] | None = (0.0, 1.0),
     iterations: int = 10,
     workers: int = -1,
     verbose: int = 0,
+    **filter_kwargs: tuple[float, float],
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """Generate binary masks by iteratively thresholding an image at different intensity levels.
 
@@ -448,19 +489,13 @@ def iterative_threshold(
 
     Args:
         img (np.ndarray): Input image to threshold.
-        area (tuple[float, float]): Area range (currently unused, reserved for future filtering).
         mask (np.ndarray | None, optional): Optional mask to restrict intensity computation.
             If provided, maximum intensity is computed only within the masked region.
             Defaults to None.
         exclude_mask (np.ndarray | None, optional): Optional mask to exclude regions from
             intensity computation and final binary masks. Pixels where exclude_mask is True
             will be excluded. Defaults to None.
-        circularity (tuple[float, float] | None, optional): Circularity range for filtering.
-        solidity (tuple[float, float] | None, optional): Solidity range for filtering.
-            Defaults to (0.95, 1.0).
-        aspect_ratio (tuple[float, float] | None, optional): Aspect ratio range for filtering.
-            Aspect ratio is calculated as minor_axis_length / major_axis_length.
-            Defaults to None (no filtering).
+        filter_kwargs (tuple[float, float]): Keyword arguments for filtering.
         threshold (tuple[float, float] | None, optional): Threshold range (min, max).
             If None, defaults to (0.0, img_max). If first element is None, uses 0.0.
             If second element is None, uses img_max. Defaults to (0.0, 1.0).
@@ -521,17 +556,18 @@ def iterative_threshold(
             th_max_val = img_max
         threshold = (th_min_val, th_max_val)
 
-    th_min = threshold[0]
-    th_max = threshold[1]
-
-    step_size = (th_max - th_min) / iterations
-
     # Generate threshold values from max to min (reverse the ascending array)
     # img_min = 0.0
+    th_min, th_max = threshold
+    step_size = (th_max - th_min) / iterations
     thresholds = np.arange(th_max, th_min, -step_size)
 
     # Calculate dilation target area (constant for all iterations)
-    dilate_target_area = 0.5 * (area[1] + area[0]) if area is not None else None
+    dilate_target_area = (
+        0.5 * (filter_kwargs["area"][0] + filter_kwargs["area"][1])
+        if "area" in filter_kwargs
+        else None
+    )
 
     # Initialize exclude_mask if None
     if exclude_mask is None:
@@ -556,10 +592,7 @@ def iterative_threshold(
         binary_mask = binary_mask & ~exclude_mask
         filtered_binary_mask = filter_mask(
             binary_mask,
-            area=area,
-            circularity=circularity,
-            solidity=solidity,
-            aspect_ratio=aspect_ratio,
+            **filter_kwargs,
         )
 
         # All regions found at this threshold are new (since we excluded previous ones)
@@ -1457,122 +1490,200 @@ def identify_lattice_holes(mask: np.ndarray, radius: float = 1.0) -> np.ndarray:
         return hole_mask
 
 
+def _filter_mask_2d(
+    plane: np.ndarray,
+    **kwargs: tuple[float, float],
+) -> np.ndarray:
+    """Filter a single 2D plane based on regionprops attribute value ranges.
+
+    Internal function used by filter_mask for parallel processing.
+
+    Args:
+        plane: 2D binary mask plane to filter.
+        **kwargs: Keyword arguments where each key is an attribute name in regionprops
+            and each value is a tuple[float, float] representing (min, max) range.
+
+    Returns:
+        np.ndarray: Filtered 2D binary mask.
+    """
+    from skimage.measure import label as sk_label, regionprops
+
+    plane = plane.copy()  # Work on a copy to avoid modifying the original
+    plane_bool = plane.astype(bool, copy=False)
+
+    if not np.any(plane_bool):
+        return plane
+
+    lbl = sk_label(plane_bool, connectivity=1)
+    # Use same extra_properties as object_stats_plane to ensure consistency
+    props = regionprops(
+        lbl,
+        extra_properties=(
+            circularity,
+            bbox_width,
+            bbox_height,
+            aspect_ratio,
+        ),
+    )
+
+    # Use filter_regionprops to get filtered list
+    filtered_props = filter_regionprops(props, **kwargs)
+
+    # Get labels to keep
+    labels_to_keep = {prop.label for prop in filtered_props}
+
+    # Remove regions that are not in the filtered list
+    for prop in props:
+        if prop.label not in labels_to_keep:
+            plane[lbl == prop.label] = 0
+
+    return plane
+
+
 def filter_mask(
     mask: np.ndarray,
-    area: tuple[float, float] | None = None,
-    circularity: tuple[float, float] | None = None,
-    solidity: tuple[float, float] | None = None,
-    aspect_ratio: tuple[float, float] | None = None,
     inplace: bool = False,
+    workers: int = -1,
+    verbose: int = 0,
+    **kwargs: tuple[float, float],
 ) -> np.ndarray:
-    """Filter a binary mask based on area, circularity, solidity, and/or aspect_ratio criteria.
+    """Filter a binary mask based on regionprops attribute value ranges.
+
+    Uses filter_regionprops to filter objects based on any regionprops attributes.
+    Common attributes include: area, circularity, solidity, aspect_ratio, bbox_area,
+    bbox_width, bbox_height, eccentricity, etc.
 
     Args:
         mask (np.ndarray): Binary mask stack to filter. Can be 2D (H, W) or 3D (T, H, W).
-        area (tuple[float, float] | None, optional): Tuple of (min_area, max_area) to filter by.
-            Objects outside this range will be removed. Defaults to None (no filtering).
-        circularity (tuple[float, float] | None, optional): Tuple of (min_circularity, max_circularity)
-            to filter by. Objects outside this range will be removed. Defaults to None (no filtering).
-        solidity (tuple[float, float] | None, optional): Tuple of (min_solidity, max_solidity)
-            to filter by. Objects outside this range will be removed. Defaults to None (no filtering).
-        aspect_ratio (tuple[float, float] | None, optional): Tuple of (min_aspect_ratio, max_aspect_ratio)
-            to filter by. Aspect ratio is calculated as minor_axis_length / major_axis_length of an
-            ellipsoid fitted to the region. Objects outside this range will be removed.
-            Defaults to None (no filtering).
         inplace (bool): If True, filter the mask in place. Defaults to False.
+        workers (int): Number of workers for parallel processing. Defaults to -1 (all available cores).
+        verbose (int): Verbosity level for joblib.Parallel. Defaults to 0 (no output).
+        **kwargs: Keyword arguments where each key is an attribute name in regionprops
+            and each value is a tuple[float, float] representing (min, max) range.
+            Objects outside any specified range will be removed.
+
     Returns:
         np.ndarray: Filtered binary mask with same shape as input.
-    """
-    logger.info(
-        "Filtering mask with area: %s, circularity: %s, solidity: %s, and aspect_ratio: %s",
-        area,
-        circularity,
-        solidity,
-        aspect_ratio,
-    )
-    from skimage.measure import label as sk_label, regionprops
 
+    Examples:
+        >>> # Filter by area
+        >>> filtered = filter_mask(mask, area=(10.0, 100.0))
+        >>> # Filter by multiple attributes
+        >>> filtered = filter_mask(mask, area=(10.0, 100.0), solidity=(0.8, 1.0), eccentricity=(0.0, 0.5))
+    """
     if mask.ndim < 2:
         raise ValueError("mask must be at least 2D with last two axes as (Y, X)")
 
-    # Extract area, circularity, solidity, and aspect_ratio bounds
-    area_min, area_max = area if area is not None else (None, None)
-    circularity_min, circularity_max = (
-        circularity if circularity is not None else (None, None)
-    )
-    solidity_min, solidity_max = solidity if solidity is not None else (None, None)
-    aspect_ratio_min, aspect_ratio_max = (
-        aspect_ratio if aspect_ratio is not None else (None, None)
+    if not kwargs:
+        logger.warning("No filtering criteria provided, returning original mask")
+        return mask if inplace else mask.copy()
+
+    logger.info(
+        "Filtering mask with criteria: %s",
+        list(kwargs.keys()),
     )
 
-    # Prepare output
-    if inplace:
-        result = mask
-    else:
-        result = mask.copy()
-
-    # Handle 2D case - wrap in list for uniform loop
+    # Handle 2D case
     if mask.ndim == 2:
-        planes_to_process = [result]
-    else:
-        # Handle 3D case - create list of plane views
-        planes_to_process = [result[i] for i in range(result.shape[0])]
+        filtered_plane = _filter_mask_2d(mask, **kwargs)
+        if inplace:
+            mask[:] = filtered_plane
+            return mask
+        return filtered_plane
 
-    # Process each plane
-    for i, plane in enumerate(planes_to_process):
-        plane_bool = plane.astype(bool, copy=False)
-        if np.any(plane_bool):
-            lbl = sk_label(plane_bool, connectivity=1)
-            props = regionprops(lbl)
+    # Handle 3D case - process planes in parallel
+    # Prepare list of planes to process
+    planes_list = [mask[i] for i in range(mask.shape[0])]
 
-            # Identify regions to remove
-            for prop in props:
-                # Check area filter
-                area_ok = True
-                if area_min is not None and area_max is not None:
-                    area_ok = area_min <= prop.area <= area_max
+    # Process planes in parallel
+    filtered_planes = Parallel(n_jobs=workers, verbose=verbose)(
+        delayed(_filter_mask_2d)(plane, **kwargs) for plane in planes_list
+    )
 
-                # Check circularity filter
-                circularity_ok = True
-                if circularity_min is not None and circularity_max is not None:
-                    if prop.perimeter > 0:
-                        circ = (
-                            4.0
-                            * np.pi
-                            * float(prop.area)
-                            / (float(prop.perimeter) ** 2)
-                        )
-                        circularity_ok = circularity_min <= circ <= circularity_max
-                    else:
-                        circularity_ok = False
+    # Stack results
+    result = np.stack(filtered_planes, axis=0)
 
-                # Check solidity filter
-                solidity_ok = True
-                if solidity_min is not None and solidity_max is not None:
-                    if hasattr(prop, "solidity") and not np.isnan(prop.solidity):
-                        sol = float(prop.solidity)
-                        solidity_ok = solidity_min <= sol <= solidity_max
-                    else:
-                        solidity_ok = False
-
-                # Check aspect_ratio filter
-                aspect_ratio_ok = True
-                if aspect_ratio_min is not None and aspect_ratio_max is not None:
-                    if (
-                        hasattr(prop, "major_axis_length")
-                        and hasattr(prop, "minor_axis_length")
-                        and prop.major_axis_length > 0
-                    ):
-                        ar = float(prop.minor_axis_length / prop.major_axis_length)
-                        aspect_ratio_ok = aspect_ratio_min <= ar <= aspect_ratio_max
-                    else:
-                        aspect_ratio_ok = False
-
-                # Remove region if it doesn't pass filters
-                if not (area_ok and circularity_ok and solidity_ok and aspect_ratio_ok):
-                    plane[lbl == prop.label] = 0
+    # If inplace, copy results back to original array
+    if inplace:
+        mask[:] = result
+        return mask
 
     return result
+
+
+def filter_regionprops(
+    props: list,
+    **kwargs: tuple[float, float],
+) -> list:
+    """Filter a list of regionprops objects based on attribute value ranges.
+
+    Args:
+        props: List of regionprops objects to filter.
+        **kwargs: Keyword arguments where each key is an attribute name in regionprops
+            and each value is a tuple[float, float] representing (min, max) range.
+            Only regionprops objects where all specified attributes fall within their
+            respective ranges will be kept.
+
+    Returns:
+        list: Filtered list of regionprops objects.
+
+    Examples:
+        >>> props = regionprops(label_image)
+        >>> # Filter by area between 10 and 100, and circularity between 0.5 and 1.0
+        >>> filtered = filter_regionprops(props, area=(10.0, 100.0), circularity=(0.5, 1.0))
+    """
+    if not props:
+        return props
+
+    if not kwargs:
+        logger.warning("No filtering criteria provided, returning original list")
+        return props
+
+    filtered = []
+    missing_attributes = set()
+
+    # Get list of extra property names from first prop (if available)
+    # Note: props is guaranteed to be non-empty due to check at beginning
+    extra_prop_names = set()
+    if (
+        props
+        and hasattr(props[0], "_extra_properties")
+        and isinstance(props[0]._extra_properties, dict)
+    ):
+        extra_prop_names = set(props[0]._extra_properties.keys())
+
+    for prop in props:
+        keep = True
+        for attr_name, (min_val, max_val) in kwargs.items():
+            attr_value = None
+
+            try:
+                attr_value = getattr(prop, attr_name)
+            except AttributeError:
+                missing_attributes.add(attr_name)
+                continue
+
+            # Handle NaN values
+            if isinstance(attr_value, (int, float)) and np.isnan(attr_value):
+                keep = False
+                break
+
+            # Check if value is outside inclusive range [min_val, max_val]
+            # Exclude if value <= min_val (too small) or >= max_val (too large)
+            if (min_val is not None and attr_value < min_val) or (
+                max_val is not None and attr_value > max_val
+            ):
+                keep = False
+                break
+
+        if keep:
+            filtered.append(prop)
+
+    logger.debug(
+        f"Filtered {len(props)} regionprops objects to {len(filtered)} based on criteria: {list(kwargs.keys())}; missing attributes: {missing_attributes}"
+    )
+
+    return filtered
 
 
 def circularity(regionmask):
@@ -1590,7 +1701,7 @@ def circularity(regionmask):
     return float("nan")
 
 
-def _bbox_width(regionmask, intensity_image):
+def bbox_width(regionmask, intensity_image):
     """Compute bounding box width from region mask.
 
     Uses numpy operations to find column bounds more efficiently.
@@ -1607,7 +1718,7 @@ def _bbox_width(regionmask, intensity_image):
     return float(col_indices[-1] - col_indices[0] + 1)
 
 
-def _bbox_height(regionmask, intensity_image):
+def bbox_height(regionmask, intensity_image):
     """Compute bounding box height from region mask.
 
     Uses numpy operations to find row bounds more efficiently.
@@ -1677,8 +1788,8 @@ def object_stats_plane(plane: np.ndarray, connectivity: int = 1) -> list:
         lbl,
         extra_properties=(
             circularity,
-            _bbox_width,
-            _bbox_height,
+            bbox_width,
+            bbox_height,
             aspect_ratio,
         ),
     )
@@ -1985,9 +2096,6 @@ def object_stats(
     results = Parallel(n_jobs=workers, verbose=verbose)(
         delayed(object_stats_plane)(plane, connectivity) for plane in mask
     )
-    print(
-        f"first result: {results[0][0].circularity}, type: {type(results[0][0].circularity)}, last result: {results[-1][-1].circularity}, type: {type(results[-1][-1].circularity)}"
-    )
 
     combined = summarize(results)  # type: ignore
 
@@ -2075,176 +2183,3 @@ def mark_large_objects(
                     out[idx][mask2d] = 2
 
     return out
-
-
-def voronois(
-    stack: np.ndarray,
-    connectivity: int = 1,
-) -> tuple:
-    """Create napari layers for Voronoi tessellation per YX plane.
-
-    Args:
-        stack (np.ndarray): Binary array. Last two axes are (Y, X). Supports 2D (H,W)
-            and 3D (T,H,W); for 3D, tessellation is computed per time-plane and
-            layers contain coordinates with leading time dimension.
-        connectivity (int): Connectivity for labeling objects.
-
-    Returns:
-        tuple: (points_layer, polygons) from napari.layers, where the points layer
-        contains object centroids and polygons contains Voronoi cell vertices.
-        The points layer features include centroid coordinates (y, x), area,
-        number of vertices, and vertex distance statistics.
-    """
-    logger.info("Creating Voronoi tessellation layers")
-
-    try:
-        from napari.layers import Shapes, Points  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "napari is required to create layers. Please install napari."
-        ) from exc
-
-    if stack.ndim not in (2, 3):
-        raise ValueError("stack must be 2D (H,W) or 3D (T,H,W)")
-
-    mask = stack.astype(bool, copy=False)
-
-    # Prepare containers for polygons (list of (N, D) arrays) and points
-    polygons: list[np.ndarray] = []
-    points_list: list[np.ndarray] = []
-    # Features stored as lists aligned with points_list
-    feat_y: list[float] = []
-    feat_x: list[float] = []
-    feat_area: list[float] = []
-    feat_nverts: list[int] = []
-    feat_plane: list[int] = []
-    feat_vertex_dist_mean: list[float] = []
-    feat_vertex_dist_std: list[float] = []
-
-    if stack.ndim == 2:
-        planes = [()]
-    else:
-        planes = list(range(stack.shape[0]))
-
-    def _process_plane(plane_idx):
-        if plane_idx == ():
-            binary = mask
-        else:
-            binary = mask[plane_idx]
-        lbl = sk_label(binary, connectivity=connectivity)
-        props = regionprops(lbl)
-        if not props or len(props) < 2:
-            return
-        # Collect centroids (x,y) for Voronoi
-        all_centroids_xy = np.array(
-            [[p.centroid[1], p.centroid[0]] for p in props], dtype=np.float64
-        )
-        # Build Voronoi diagram
-        vor = Voronoi(all_centroids_xy)
-        for pi, prop in enumerate(props):
-            reg_index = vor.point_region[pi]
-            vert_index = vor.regions[reg_index]
-            if -1 in vert_index or len(vert_index) == 0:
-                continue
-            else:
-                if stack.ndim == 2:
-                    vertices = np.array(
-                        [
-                            [vor.vertices[v_index][1], vor.vertices[v_index][0]]
-                            for v_index in vert_index
-                        ],
-                        dtype=np.float32,
-                    )
-                    point = np.array(
-                        [prop.centroid[0], prop.centroid[1]], dtype=np.float32
-                    )
-                else:
-                    vertices = np.array(
-                        [
-                            [
-                                float(plane_idx),
-                                vor.vertices[v_index][1],
-                                vor.vertices[v_index][0],
-                            ]
-                            for v_index in vert_index
-                        ],
-                        dtype=np.float32,
-                    )
-                    point = np.array(
-                        [float(plane_idx), prop.centroid[0], prop.centroid[1]],
-                        dtype=np.float32,
-                    )
-                # only add points if all cell vertices are within the stack boundaries
-                if (
-                    np.all(vertices[:, -2] >= 0.0)
-                    and np.all(vertices[:, -2] <= stack.shape[-2])
-                    and np.all(vertices[:, -1] >= 0.0)
-                    and np.all(vertices[:, -1] <= stack.shape[-1])
-                ):
-                    # Calculate distances from centroid to each vertex
-                    # Extract spatial coordinates (y, x) from centroid
-                    if stack.ndim == 2:
-                        centroid_yx = np.array(
-                            [prop.centroid[0], prop.centroid[1]], dtype=np.float64
-                        )
-                        vertices_yx = vertices
-                    else:
-                        centroid_yx = np.array(
-                            [prop.centroid[0], prop.centroid[1]], dtype=np.float64
-                        )
-                        vertices_yx = vertices[
-                            :, -2:
-                        ]  # Extract (y, x) from (N, 3) -> (N, 2)
-
-                    # Calculate Euclidean distance from centroid to each vertex
-                    distances = np.linalg.norm(vertices_yx - centroid_yx, axis=1)
-                    dist_mean = float(np.mean(distances))
-                    dist_std = float(np.std(distances, ddof=0))
-
-                    polygons.append(vertices)
-                    points_list.append(point)
-                    feat_area.append(float(prop.area))
-                    feat_nverts.append(int(len(vert_index)))
-                    feat_plane.append(int(plane_idx if plane_idx != () else 0))
-                    feat_y.append(float(prop.centroid[0]))
-                    feat_x.append(float(prop.centroid[1]))
-                    feat_vertex_dist_mean.append(dist_mean)
-                    feat_vertex_dist_std.append(dist_std)
-
-    for p in planes:
-        _process_plane(p)
-
-    # Create napari layers
-    pts = np.stack(points_list, axis=0)
-    color_cycle = 20 * [
-        "red",
-        "green",
-        "blue",
-        "yellow",
-        "purple",
-        "orange",
-        "brown",
-        "pink",
-        "gray",
-        "black",
-    ]
-    color_cycle = color_cycle[: np.max(feat_nverts)]
-    print(f"color_cycle: {color_cycle}")
-    features = {
-        "plane": feat_plane,
-        "centroid_y": feat_y,
-        "centroid_x": feat_x,
-        "area": feat_area,
-        "n_vertices": feat_nverts,
-        "vertex_dist_mean": feat_vertex_dist_mean,
-        "vertex_dist_std": feat_vertex_dist_std,
-    }
-    points_layer = Points(
-        data=pts,
-        name="Atoms",
-        face_color="n_vertices",
-        face_color_cycle=color_cycle,
-        features=features,
-    )
-
-    return points_layer, polygons

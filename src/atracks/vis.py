@@ -1,5 +1,11 @@
+import logging
+
 import numpy as np
 from joblib import Parallel, delayed
+from scipy.spatial import Voronoi
+from skimage.measure import label as sk_label, regionprops
+
+logger = logging.getLogger(__name__)
 
 
 def spatial_probability_3d(
@@ -145,3 +151,253 @@ def export_animation(
     animation.capture_keyframe(last_frame_idx)
 
     animation.animate(fname, fps=fps)
+
+
+def voronois_2d(
+    plane_idx: int | tuple,
+    binary: np.ndarray,
+    stack_shape: tuple,
+    connectivity: int = 1,
+) -> tuple:
+    """Process a single plane and return data for Voronoi tessellation.
+
+    Args:
+        plane_idx: Index of the plane. Use () for 2D case.
+        binary: Binary mask for the plane.
+        stack_shape: Shape of the full stack (used for boundary checking).
+        connectivity: Connectivity for labeling objects.
+
+    Returns:
+        tuple: (polygons, points, features_dict) where features_dict contains
+            all the feature lists for this plane.
+    """
+    plane_polygons = []
+    plane_points = []
+    plane_feat_y = []
+    plane_feat_x = []
+    plane_feat_area = []
+    plane_feat_nverts = []
+    plane_feat_plane = []
+    plane_feat_vertex_dist_mean = []
+    plane_feat_vertex_dist_std = []
+
+    lbl = sk_label(binary, connectivity=connectivity)
+    props = regionprops(lbl)
+    if not props or len(props) < 2:
+        return (
+            plane_polygons,
+            plane_points,
+            {
+                "y": plane_feat_y,
+                "x": plane_feat_x,
+                "area": plane_feat_area,
+                "n_vertices": plane_feat_nverts,
+                "plane": plane_feat_plane,
+                "vertex_dist_mean": plane_feat_vertex_dist_mean,
+                "vertex_dist_std": plane_feat_vertex_dist_std,
+            },
+        )
+    # Collect centroids (x,y) for Voronoi
+    all_centroids_xy = np.array(
+        [[p.centroid[1], p.centroid[0]] for p in props], dtype=np.float64
+    )
+    # Build Voronoi diagram
+    vor = Voronoi(all_centroids_xy)
+    is_2d = len(stack_shape) == 2
+
+    for pi, prop in enumerate(props):
+        reg_index = vor.point_region[pi]
+        vert_index = vor.regions[reg_index]
+        if -1 in vert_index or len(vert_index) == 0:
+            continue
+        else:
+            if is_2d:
+                vertices = np.array(
+                    [
+                        [vor.vertices[v_index][1], vor.vertices[v_index][0]]
+                        for v_index in vert_index
+                    ],
+                    dtype=np.float32,
+                )
+                point = np.array([prop.centroid[0], prop.centroid[1]], dtype=np.float32)
+            else:
+                vertices = np.array(
+                    [
+                        [
+                            float(plane_idx),
+                            vor.vertices[v_index][1],
+                            vor.vertices[v_index][0],
+                        ]
+                        for v_index in vert_index
+                    ],
+                    dtype=np.float32,
+                )
+                point = np.array(
+                    [float(plane_idx), prop.centroid[0], prop.centroid[1]],
+                    dtype=np.float32,
+                )
+            # only add points if all cell vertices are within the stack boundaries
+            if (
+                np.all(vertices[:, -2] >= 0.0)
+                and np.all(vertices[:, -2] <= stack_shape[-2])
+                and np.all(vertices[:, -1] >= 0.0)
+                and np.all(vertices[:, -1] <= stack_shape[-1])
+            ):
+                # Calculate distances from centroid to each vertex
+                # Extract spatial coordinates (y, x) from centroid
+                if is_2d:
+                    centroid_yx = np.array(
+                        [prop.centroid[0], prop.centroid[1]], dtype=np.float64
+                    )
+                    vertices_yx = vertices
+                else:
+                    centroid_yx = np.array(
+                        [prop.centroid[0], prop.centroid[1]], dtype=np.float64
+                    )
+                    vertices_yx = vertices[
+                        :, -2:
+                    ]  # Extract (y, x) from (N, 3) -> (N, 2)
+
+                # Calculate Euclidean distance from centroid to each vertex
+                distances = np.linalg.norm(vertices_yx - centroid_yx, axis=1)
+                dist_mean = float(np.mean(distances))
+                dist_std = float(np.std(distances, ddof=0))
+
+                plane_polygons.append(vertices)
+                plane_points.append(point)
+                plane_feat_area.append(float(prop.area))
+                plane_feat_nverts.append(int(len(vert_index)))
+                plane_feat_plane.append(int(plane_idx if plane_idx != () else 0))
+                plane_feat_y.append(float(prop.centroid[0]))
+                plane_feat_x.append(float(prop.centroid[1]))
+                plane_feat_vertex_dist_mean.append(dist_mean)
+                plane_feat_vertex_dist_std.append(dist_std)
+
+    return (
+        plane_polygons,
+        plane_points,
+        {
+            "y": plane_feat_y,
+            "x": plane_feat_x,
+            "area": plane_feat_area,
+            "n_vertices": plane_feat_nverts,
+            "plane": plane_feat_plane,
+            "vertex_dist_mean": plane_feat_vertex_dist_mean,
+            "vertex_dist_std": plane_feat_vertex_dist_std,
+        },
+    )
+
+
+def voronois(
+    stack: np.ndarray,
+    connectivity: int = 1,
+    workers: int = -1,
+    verbose: int = 0,
+) -> tuple:
+    """Create napari layers for Voronoi tessellation per YX plane.
+
+    Args:
+        stack (np.ndarray): Binary array. Last two axes are (Y, X). Supports 2D (H,W)
+            and 3D (T,H,W); for 3D, tessellation is computed per time-plane and
+            layers contain coordinates with leading time dimension.
+        connectivity (int): Connectivity for labeling objects.
+        workers (int): Number of workers for parallel processing. Defaults to -1 (all available cores).
+        verbose (int): Verbosity level for joblib.Parallel. Defaults to 0 (no output).
+    Returns:
+        tuple: (points_layer, polygons) from napari.layers, where the points layer
+        contains object centroids and polygons contains Voronoi cell vertices.
+        The points layer features include centroid coordinates (y, x), area,
+        number of vertices, and vertex distance statistics.
+    """
+    logger.info("Creating Voronoi tessellation layers")
+
+    try:
+        from napari.layers import Shapes, Points  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "napari is required to create layers. Please install napari."
+        ) from exc
+
+    if stack.ndim not in (2, 3):
+        raise ValueError("stack must be 2D (H,W) or 3D (T,H,W)")
+
+    mask = stack.astype(bool, copy=False)
+
+    # Prepare containers for polygons (list of (N, D) arrays) and points
+    polygons: list[np.ndarray] = []
+    points_list: list[np.ndarray] = []
+    # Features stored as lists aligned with points_list
+    feat_y: list[float] = []
+    feat_x: list[float] = []
+    feat_area: list[float] = []
+    feat_nverts: list[int] = []
+    feat_plane: list[int] = []
+    feat_vertex_dist_mean: list[float] = []
+    feat_vertex_dist_std: list[float] = []
+
+    if stack.ndim == 2:
+        planes = [()]
+        planes_data = [(plane_idx, mask) for plane_idx in planes]
+    else:
+        planes = list(range(stack.shape[0]))
+        planes_data = [(plane_idx, mask[plane_idx]) for plane_idx in planes]
+
+    # Process planes in parallel and collect results
+    results = Parallel(n_jobs=workers, verbose=verbose)(
+        delayed(voronois_2d)(plane_idx, binary, stack.shape, connectivity)
+        for plane_idx, binary in planes_data
+    )
+
+    # Merge results from all planes
+    for plane_polygons, plane_points, plane_features in results:
+        polygons.extend(plane_polygons)
+        points_list.extend(plane_points)
+        feat_y.extend(plane_features["y"])
+        feat_x.extend(plane_features["x"])
+        feat_area.extend(plane_features["area"])
+        feat_nverts.extend(plane_features["n_vertices"])
+        feat_plane.extend(plane_features["plane"])
+        feat_vertex_dist_mean.extend(plane_features["vertex_dist_mean"])
+        feat_vertex_dist_std.extend(plane_features["vertex_dist_std"])
+
+    # Create napari layers
+    pts = np.stack(points_list, axis=0)
+    color_cycle = 20 * [
+        "red",
+        "green",
+        "blue",
+        "yellow",
+        "purple",
+        "orange",
+        "brown",
+        "pink",
+        "gray",
+        "black",
+    ]
+    color_cycle = color_cycle[: np.max(feat_nverts)]
+    print(f"color_cycle: {color_cycle}")
+    features = {
+        "plane": feat_plane,
+        "centroid_y": feat_y,
+        "centroid_x": feat_x,
+        "area": feat_area,
+        "n_vertices": feat_nverts,
+        "vertex_dist_mean": feat_vertex_dist_mean,
+        "vertex_dist_std": feat_vertex_dist_std,
+    }
+    points_layer = Points(
+        data=pts,
+        name="Atoms",
+        face_color="n_vertices",
+        face_color_cycle=color_cycle,
+        features=features,
+    )
+    polygons_layer = Shapes(
+        data=polygons,
+        name="Voronoi",
+        edge_color="blue",
+        face_color="transparent",
+        shape_type="polygon",
+    )
+
+    return points_layer, polygons

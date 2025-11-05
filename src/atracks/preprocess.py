@@ -3,6 +3,34 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 from skimage.filters import gaussian
+from joblib import Parallel, delayed
+
+
+def preprocess(
+    input: str | np.ndarray,
+    sigma_low: float | tuple[float, ...] = 1.0,
+    sigma_high: float | tuple[float, ...] = 5.0,
+    workers: int = -1,
+    verbose: int = 10,
+) -> None:
+    """Preprocess the input image stack by denoising and applying a Difference of Gaussians filter.
+
+    Args:
+        input (str | np.ndarray): Input image stack.
+        sigma_low: Sigma for the first (lower) Gaussian blur.
+        sigma_high: Sigma for the second (higher) Gaussian blur.
+        workers: Number of workers for parallel processing. Defaults to -1 (all available cores).
+        verbose: Verbosity level for joblib.Parallel. Defaults to 10 (medium output).
+    """
+    denoised = noise2stack_denoise(input)
+    dog = dog_3d(
+        input,
+        sigma_low=sigma_low,
+        sigma_high=sigma_high,
+        workers=workers,
+        verbose=verbose,
+    )
+    return denoised, dog
 
 
 def noise2stack_denoise(
@@ -58,12 +86,37 @@ def noise2stack_denoise(
     return denoised
 
 
-def dog_gpu(
+def dog_plane(
+    plane: np.ndarray,
+    sigma_low: float | tuple[float, ...],
+    sigma_high: float | tuple[float, ...],
+    mode: str = "reflect",
+    normalize: bool = True,
+) -> np.ndarray:
+    """Compute Difference of Gaussians (DoG) for a single plane.
+
+    Args:
+        plane: Input plane.
+        sigma_low: Sigma for the first (lower) Gaussian blur.
+        sigma_high: Sigma for the second (higher) Gaussian blur.
+        mode: Border handling mode passed to skimage.filters.gaussian (default: "reflect").
+        normalize: If True, normalize the output intensity will be rescaled to min:max range of the particular dtype. Defaults to True.
+    Returns:
+        np.ndarray: Difference of Gaussians (DoG) for the single plane.
+    """
+    g_low = gaussian(plane, sigma=sigma_low, mode=mode, preserve_range=True)
+    g_high = gaussian(plane, sigma=sigma_high, mode=mode, preserve_range=True)
+    return g_low - g_high
+
+
+def dog_3d(
     array: np.ndarray,
     sigma_low: float | tuple[float, ...],
     sigma_high: float | tuple[float, ...],
     mode: str = "reflect",
     normalize: bool = True,
+    workers: int = -1,
+    verbose: int = 0,
 ) -> np.ndarray:
     """Compute Difference of Gaussians (DoG) using NumPy + scikit-image.
 
@@ -73,7 +126,8 @@ def dog_gpu(
         sigma_high: Sigma for the second (higher) Gaussian blur.
         mode: Border handling mode passed to skimage.filters.gaussian (default: "reflect").
         normalize: If True, normalize the output intensity will be rescaled to min:max range of the particular dtype. Defaults to True.
-
+        workers: Number of workers for parallel processing. Defaults to -1 (all available cores).
+        verbose: Verbosity level for joblib.Parallel. Defaults to 0 (no output).
     Returns:
         np.ndarray: g(sigma_low) - g(sigma_high) with same shape and dtype as input.
             If normalize=True, output will be normalized to min:max range of the particular dtype.
@@ -81,14 +135,11 @@ def dog_gpu(
     input_dtype = array.dtype
     # If 3D, treat as sequence of 2D planes along axis 0 (last two axes are Y, X)
     if array.ndim == 3:
-        planes = []
-        for i in range(array.shape[0]):
-            g_low = gaussian(array[i], sigma=sigma_low, mode=mode, preserve_range=True)
-            g_high = gaussian(
-                array[i], sigma=sigma_high, mode=mode, preserve_range=True
-            )
-            planes.append(g_low - g_high)
-        dog = np.stack(planes, axis=0)
+        dog = Parallel(n_jobs=workers, verbose=verbose)(
+            delayed(dog_plane)(array[i], sigma_low, sigma_high, mode, normalize)
+            for i in range(array.shape[0])
+        )
+        dog = np.stack(dog, axis=0)
     else:
         # Generic nD filtering across all axes
         g_low = gaussian(array, sigma=sigma_low, mode=mode, preserve_range=True)
@@ -97,8 +148,8 @@ def dog_gpu(
 
     # Normalize to [0, 1] if requested
     if normalize:
-        dog_min = float(dog.min())
-        dog_max = float(dog.max())
+        dog_min = np.min(dog)
+        dog_max = np.max(dog)
         if dog_max > dog_min:
             dog = (dog - dog_min) / (dog_max - dog_min)
         else:
