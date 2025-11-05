@@ -5,7 +5,32 @@
 [![Python Version](https://img.shields.io/pypi/pyversions/atracks.svg?color=green)](https://python.org)
 [![codecov](https://codecov.io/gh/ksiller/atracks/branch/main/graph/badge.svg)](https://codecov.io/gh/ksiller/atracks)
 
-Tool to track atom positions.
+**Atracks** is a Python toolkit for analyzing atom positions and coordination in microscopy image stacks. It provides automated segmentation, statistical analysis, and visualization of atomic-scale structures in 2D and 3D image data.
+
+## Capabilities
+
+Atracks offers a comprehensive suite of image analysis tools for atomic-scale microscopy:
+
+- **Segmentation**: Multiple segmentation methods including local thresholding, iterative thresholding, and watershed-based techniques to identify atom positions in image stacks
+- **Object Statistics**: Quantitative analysis of detected objects including area, perimeter, circularity, solidity, aspect ratio, eccentricity, and nearest-neighbor distances
+- **Filtering**: Flexible filtering based on object properties (area, circularity, solidity, aspect ratio, etc.) to refine detections
+- **Lattice Analysis**: Identification of lattice holes and analysis of atomic coordination patterns
+- **Voronoi Tessellation**: Construction of Voronoi diagrams to analyze local coordination environments
+- **Spatial Probability Maps**: Generation of 3D probability distributions for atom positions based on detected centroids
+- **Temporal Analysis**: Weighted temporal summation for analyzing time-series data with decay-based contributions
+- **Visualization**: Export animations and create napari-compatible visualization layers
+
+## Approach
+
+Atracks uses a multi-stage analysis pipeline:
+
+1. **Segmentation**: Detects atom positions using adaptive thresholding and morphological operations
+2. **Filtering**: Refines detections based on statistical properties of the detected objects
+3. **Statistics**: Computes comprehensive object statistics including spatial distribution metrics
+4. **Analysis**: Performs Voronoi tessellation and coordination analysis to characterize local atomic environments
+5. **Visualization**: Generates probability maps and visualization layers for interactive exploration
+
+The toolkit leverages scikit-image for image processing, scipy for spatial operations, and joblib for parallel processing across multiple planes in image stacks. It supports both 2D images and 3D/4D image stacks with efficient parallel processing.
 
 ## Installation 
 
@@ -26,7 +51,7 @@ Atracks is reading image files using the [Bioio](https://github.com/bioio-devs/b
 
 In a command line shell, run the following command:
 ```
-atracks -i imagestack.nd2 -o my_outputdir -s 1 -d 2 -r 1
+atracks -i imagestack.nd2 -o my_outputdir -g -f 1-100
 ```
 
 **Command line arguments:**
