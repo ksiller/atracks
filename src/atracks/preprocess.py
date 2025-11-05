@@ -5,7 +5,9 @@ from scipy.ndimage import uniform_filter1d
 from skimage.filters import gaussian
 
 
-def noise2stack_denoise(stack: np.ndarray, window: int = 5, exclude_center: bool = True) -> np.ndarray:
+def noise2stack_denoise(
+    stack: np.ndarray, window: int = 5, exclude_center: bool = True
+) -> np.ndarray:
     """Denoise an image stack by averaging temporal neighbors (Noise2Stack-inspired).
 
     This implements a simple, non-learning variant inspired by the Noise2Stack idea:
@@ -71,7 +73,7 @@ def dog_gpu(
         sigma_high: Sigma for the second (higher) Gaussian blur.
         mode: Border handling mode passed to skimage.filters.gaussian (default: "reflect").
         normalize: If True, normalize the output intensity will be rescaled to min:max range of the particular dtype. Defaults to True.
-    
+
     Returns:
         np.ndarray: g(sigma_low) - g(sigma_high) with same shape and dtype as input.
             If normalize=True, output will be normalized to min:max range of the particular dtype.
@@ -82,7 +84,9 @@ def dog_gpu(
         planes = []
         for i in range(array.shape[0]):
             g_low = gaussian(array[i], sigma=sigma_low, mode=mode, preserve_range=True)
-            g_high = gaussian(array[i], sigma=sigma_high, mode=mode, preserve_range=True)
+            g_high = gaussian(
+                array[i], sigma=sigma_high, mode=mode, preserve_range=True
+            )
             planes.append(g_low - g_high)
         dog = np.stack(planes, axis=0)
     else:
@@ -109,5 +113,3 @@ def dog_gpu(
     else:
         dog = dog.astype(input_dtype, copy=False)
     return dog
-
-

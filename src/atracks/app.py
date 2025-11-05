@@ -16,9 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="atracks",
-        description=(
-            "Tool to track atom coordination over time."
-        ),
+        description=("Tool to track atom coordination over time."),
     )
     parser.add_argument(
         "-l",
@@ -70,11 +68,15 @@ def main() -> None:
     args = parser.parse_args()
 
     # Configure logging as early as possible
-    level_name = str(args.loglevel).upper() if getattr(args, "loglevel", None) else "INFO"
+    level_name = (
+        str(args.loglevel).upper() if getattr(args, "loglevel", None) else "INFO"
+    )
     level = getattr(logging, level_name, None)
     if not isinstance(level, int):
         raise ValueError(f"Invalid log level: {args.loglevel}")
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
     # Determine compute device
     device = check_device()
@@ -90,7 +92,9 @@ def main() -> None:
         if "-" in fs:
             a, b = fs.split("-", 1)
             if not a.isdigit() or not b.isdigit():
-                raise ValueError("--frames must be positive integers like '10' or '2-40'")
+                raise ValueError(
+                    "--frames must be positive integers like '10' or '2-40'"
+                )
             a_i = int(a)
             b_i = int(b)
             if a_i < 1 or b_i < 1:
@@ -108,17 +112,19 @@ def main() -> None:
                 raise ValueError("--frames index is 1-based and must be >= 1")
             start_frame = n - 1
             end_frame = start_frame
-    
-    logger.info("Opening: %s", input)
-    image_stack = load_mp4(Path(input), to_grayscale=args.grayscale, start_frame=start_frame, end_frame=end_frame)
+
+    logger.info("Opening: %s", args.input_path)
+    image_stack = load_mp4(
+        args.input_path,
+        to_grayscale=args.grayscale,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
     logger.info("Image stack: %s", image_stack.shape)
 
-    results =analyze(
-        input=image_stack)
-    logger.info("Results: %s", results) 
-
+    results = analyze(input=image_stack)
+    logger.info("Results: %s", results)
 
 
 if __name__ == "__main__":
     main()
-

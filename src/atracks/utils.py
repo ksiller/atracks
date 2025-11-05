@@ -6,10 +6,9 @@ import logging
 
 import cv2
 import numpy as np
-import torch
+
+# import torch
 import tifffile
-from skimage.measure import label as sk_label, regionprops
-from scipy.spatial import Voronoi, cKDTree
 
 logger = logging.getLogger(__name__)
 
@@ -197,8 +196,15 @@ def to_mp4(path: Union[str, os.PathLike], stack: np.ndarray, fps: int = 15) -> N
     finally:
         writer.release()
 
-    logger.info("Wrote MP4: %s (frames=%d, fps=%d, size=%dx%d, color=%s)", file_path, t_dim, fps, width, height, color)
-
+    logger.info(
+        "Wrote MP4: %s (frames=%d, fps=%d, size=%dx%d, color=%s)",
+        file_path,
+        t_dim,
+        fps,
+        width,
+        height,
+        color,
+    )
 
 
 def to_tif(path: Union[str, os.PathLike], stack: np.ndarray) -> None:
@@ -222,7 +228,9 @@ def to_tif(path: Union[str, os.PathLike], stack: np.ndarray) -> None:
     # Write as-is; tifffile supports arbitrary numpy dtypes and shapes.
     # Use a common lossless compression to reduce size.
     tifffile.imwrite(file_path, stack, compression="deflate")
-    logger.info("Wrote TIFF: %s shape=%s dtype=%s", file_path, tuple(stack.shape), stack.dtype)
+    logger.info(
+        "Wrote TIFF: %s shape=%s dtype=%s", file_path, tuple(stack.shape), stack.dtype
+    )
 
 
 def auto_value_range(
@@ -265,4 +273,3 @@ def auto_value_range(
         upper = min(upper, max_value)
 
     return (lower, upper)
-
